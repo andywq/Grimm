@@ -98,3 +98,8 @@ PICKUP_METHOD = {
     '2_0': '私家车',
     '2_1': '步行地铁'
 }
+
+USER_IDENTITY_IMAGE_SIDE = {
+    'obverse': '正面',
+    'reverse': '反面',
+}
