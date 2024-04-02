@@ -670,7 +670,7 @@ class UserIdentity(Resource):
                         requester, target_user)
                 psu = PreSignedUrl(**params)
                 db.session.add(psu)
-                ret[side] = '/user_identity/image/{}?token={}'.format(target_user, params['token'])
+                ret[side] = '/user_idcard/image/{}?token={}&side={}'.format(target_user, params['token'], side)
             db.session.commit()
         except Exception as e:
             logger.error("failed to commit to database: %s", e)
