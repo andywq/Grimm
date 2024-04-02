@@ -10,7 +10,6 @@ import urllib3
 import uuid
 from flask import request, jsonify, send_file, current_app as app
 from flask_restx import Resource, fields, reqparse
-from sqlalchemy.dialects.mysql import insert
 from werkzeug.datastructures import FileStorage
 
 
@@ -19,19 +18,8 @@ from grimm import logger, db, engine, GrimmConfig, api
 from grimm.admin import admin, adminbiz
 from grimm.admin.admindto import AdminDto
 from grimm.models.activity import ActivityParticipant, Activity
-from grimm.models.admin import Admin, User, UserDocument, PreSignedUrl
+from grimm.models.admin import Admin, User, PreSignedUrl
 from grimm.utils import constants, smsverify, emailverify, dbutils, decrypt
-
-
-user_identity_image_get_parser = reqparse.RequestParser()
-user_identity_image_get_parser.add_argument('side', type=str, required=True, location="args")
-user_identity_image_get_parser.add_argument('token', type=str, required=True, location="args")
-
-
-user_identity_post_parser = reqparse.RequestParser()
-user_identity_post_parser.add_argument('obverse_side', type=FileStorage, required=True, location="files")
-user_identity_post_parser.add_argument('reverse_side', type=FileStorage, required=True, location="files")
-
 
 @admin.route('/login', methods=['POST'])
 class AdminLogin(Resource):
@@ -391,6 +379,10 @@ class ProfileOperate(Resource):
         new_info = json.loads(request.get_data())  # get request POST user data
         openid = request.headers.get("Authorization")
         status = db.session.query(User).filter(User.openid == openid).first()
+        if status is None:
+            # set same response as success to prevent enumeration attack
+            return jsonify({"status": "success"})
+
         status.gender = new_info["gender"]
         status.birth = new_info["birthDate"]
         status.name = new_info["name"]
@@ -420,12 +412,12 @@ class GetPhoneNumber(Resource):
     def post(self):
         """get weixin user phoneNumber"""
         info = request.get_json()  # get http POST data bytes format
-        print(info)
+        if info.get("js_code") is None:
+            return jsonify({"status": "failure"})
+
         js_code = info["js_code"]
         encrypted_data = info["encryptedData"]
         iv = info["iv"]
-        if js_code is None:
-            return jsonify({"status": "failure"})
         prefix = "https://api.weixin.qq.com/sns/jscode2session?appid="
         suffix = "&grant_type=authorization_code"
         url = prefix + GrimmConfig.WX_APP_ID + "&secret=" + GrimmConfig.WX_APP_SECRET + "&js_code=" + js_code + suffix
@@ -440,6 +432,10 @@ class GetPhoneNumber(Resource):
                 break
             retry -= 1
 
+        if retry == 0:
+            logger.error("request wxapp authorization exceed max retry")
+            feedback["status"] = "failure"
+
         if retry != 0:
             feedback["server_errcode"] = 0
             if "session_key" in feedback:
@@ -447,7 +443,6 @@ class GetPhoneNumber(Resource):
 
                 phone_decrypt = decrypt.PhoneNumberDecrypt(GrimmConfig.WX_APP_ID, sessionKey)
                 decryptData = phone_decrypt.decrypt(encrypted_data, iv)
-                print(decryptData)
                 feedback["decrypt_data"] = decryptData
                 del feedback["session_key"]
                 feedback["status"] = "success"
@@ -585,15 +580,17 @@ class SMSCode(Resource):
             )
             return jsonify({"status": "failure", "message": result})
         smsverify.drop_token(phone_number)  # drop token from pool if validated
+        # SMS_VERIFIED_OPENID is not used anywhere else, why do this?
+        # and no `expr_update` function in SQLAlchemy, comment these for now
         # try update database first, if no successful, append this openid.
-        try:
-            if db.expr_update("user", {"phone_verified": 1}, openid=openid) is False:
-                SMS_VERIFIED_OPENID[openid] = phone_number
-        except:
-            logger.warning("%s: update user phone valid status failed", openid)
-            return jsonify(
-                {"status": "failure", "message": "未知错误，请重新短信验证"}
-            )
+        # try:
+        #     if db.expr_update("user", {"phone_verified": 1}, openid=openid) is False:
+        #         SMS_VERIFIED_OPENID[openid] = phone_number
+        # except:
+        #     logger.warning("%s: update user phone valid status failed", openid)
+        #     return jsonify(
+        #         {"status": "failure", "message": "未知错误，请重新短信验证"}
+        #     )
 
         logger.info(
             "%s, %s: sms code validates successfully", phone_number, vrfcode
@@ -601,24 +598,101 @@ class SMSCode(Resource):
         return jsonify({"status": "success"})
 
 
+# TODO really need this? and attrs like idcard may should be filtered
 @admin.route("/authorize_user", methods=['GET'])
 class AuthorizeUser(Resource):
     def get(self):
         openid = request.headers.get('Authorization')
         user_info = User.query.filter(User.openid == openid).first()
+        if user_info is None:
+            return jsonify(None)
+
         return jsonify(dbutils.serialize(user_info))
 
+def is_admin(userId):
+    return Admin.query.filter(Admin.id == userId).first() is not None
 
-@admin.route("/user_identity", methods=['GET', 'POST'])
+def user_idcard_realpath(filename):
+    return os.path.realpath(
+            os.path.join(GrimmConfig.GRIMM_USER_DOCUMENT_UPLOAD_PATH,
+            filename))
+
+def pre_sign_user_identity_image(side, requester, target):
+    expire_in_minutes = 3
+    return {
+        'token': uuid.uuid4().hex,
+        'expire_at': datetime.now() + \
+                timedelta(minutes=expire_in_minutes),
+        'openid': requester,
+        'target_openid': target,
+        'side': side,
+    }
+
+@admin.route("/user_idcard/urls/<string:target_user>", methods=['GET'])
 class UserIdentity(Resource):
+    signed_image_urls = api.model('UserIdentityImageURLs', {
+        'obverse': fields.String,
+        'reverse': fields.String
+    })
     UserIdentityResponseModel = api.model('UserIdentityResponse', {
         'status': fields.String,
-        'token': fields.String(required=True, description="所请求的照片的签名后链接"),
+        'urls': fields.Nested(signed_image_urls, required=True, description="所请求照片的签名后链接"),
     })
 
+    ErrorResponseModel = api.model('ErrorResponse', {
+        'status': fields.String,
+        'error': fields.String,
+    })
+
+    @api.response(200, 'Success', UserIdentityResponseModel)
+    @api.response(404, 'User identity not found', ErrorResponseModel)
+    @api.response(401, 'Unauthorized', ErrorResponseModel)
+    @api.response(500, 'InternalError', ErrorResponseModel)
+    def get(self, target_user):
+        # TODO change to JWT get_jwt_identity
+        requester = request.headers.get('Authorization')
+        if requester != target_user and not is_admin(requester):
+            return {
+                "status": "failure",
+                "error": "该用户无法读取其他用户的信息"
+            }, 401
+
+        if User.query.filter(User.openid == target_user).first() is None:
+            return {
+                'status': 'failure',
+                'error': '用户信息未找到'
+            }, 404
+
+        ret = {}
+        try:
+            for side in constants.USER_IDENTITY_IMAGE_SIDE:
+                params = pre_sign_user_identity_image(side,
+                        requester, target_user)
+                psu = PreSignedUrl(**params)
+                db.session.add(psu)
+                ret[side] = '/user_identity/image/{}?token={}'.format(target_user, params['token'])
+            db.session.commit()
+        except Exception as e:
+            logger.error("failed to commit to database: %s", e)
+            return {
+                "status": "failure",
+                "error": f"发生未知服务器错误: {e}",
+            }, 500
+        else:
+            return {
+                "status": "success",
+                "urls": ret
+            }
+
+user_identity_post_parser = reqparse.RequestParser()
+user_identity_post_parser.add_argument('obverse', type=FileStorage, required=True, location="files")
+user_identity_post_parser.add_argument('reverse', type=FileStorage, required=True, location="files")
+
+@admin.route("/user_idcard/image", methods=['POST'])
+class UploadUserIdentity(Resource):
     UserIdentityPostModel = api.model('UserIdentityPost', {
-        "reverse_side": fields.String(required=True, description="身份证反面照片"),
-        "obverse_side": fields.String(required=True, description="身份证正面照片"),
+        "reverse": fields.String(required=True, description="身份证反面照片"),
+        "obverse": fields.String(required=True, description="身份证正面照片"),
     })
 
     ErrorResponseModel = api.model('ErrorResponse', {
@@ -631,118 +705,66 @@ class UserIdentity(Resource):
             return f'未找到{side}照片\n'
         return '' if picture_data.content_length < 1e+6 else f'{side}照片文件内容过大\n'
 
-    @api.response(200, 'Success', UserIdentityResponseModel)
-    @api.response(404, 'User identity document not found', ErrorResponseModel)
-    @api.response(401, 'Unauthorized', ErrorResponseModel)
-    @api.response(500, 'InternalError', ErrorResponseModel)
-    def get(self):
-        openid = request.headers.get('Authorization')
-        request_user = openid
-        req_body = request.get_json()
-        if req_body:
-            target_user_id = req_body.get("user-id")
-            if target_user_id:
-                if target_user_id == openid:
-                    pass
-                else:
-                    admin_user = Admin.query.filter(Admin.id == openid).first()
-                    if admin_user:
-                        openid = target_user_id
-                    else:
-                        return jsonify({
-                            "status": "failure",
-                            "error": "该用户无法读取其他用户的信息"
-                        }), 401
-        document = UserDocument.query.filter(UserDocument.openid == openid).first()
-        if not document:
-            return jsonify({
-                'status': 'failure',
-                'error': '用户信息未找到'
-            }), 404
-        transaction_id = uuid.uuid4()
-        pre_signed_token = uuid.uuid4()
-        pre_signed_url_info = PreSignedUrl()
-        pre_signed_url_info.token = pre_signed_token
-        pre_signed_url_info.openid = request_user
-        pre_signed_url_info.expire_at = (datetime.now() + timedelta(minutes=3)).isoformat()
-        pre_signed_url_info.target_openid = openid
-
-        try:
-            db.session.add(pre_signed_url_info)
-            db.session.commit()
-        except Exception as e:
-            logger.error("transaction id: %s. failed to commit to database: %s", transaction_id, e)
-            return jsonify({
-                "status": "failure",
-                "error": f"发生未知服务器错误: {e}",
-                "transaction_id": transaction_id
-            }), 500
-        else:
-            return jsonify({
-                "status": "success",
-                "token": pre_signed_token
-            })
-
     @api.doc('上传身份证正反面照片', body=UserIdentityPostModel)
     @api.response(200, 'Success')
     @api.response(400, 'Invalid request body', ErrorResponseModel)
     @api.expect(user_identity_post_parser)
     def post(self):
-        args = user_identity_post_parser.parse_args()
+        # TODO change to JWT get_jwt_identity
         openid = request.headers.get('Authorization')
-        req_body = request.files
-        if not req_body:
-            return {
-                'status': 'failure',
-                'error': '未发现上传的文件'
-            }, 400
 
-        obverse_side = args.get('obverse_side')
-        reverse_side = args.get('reverse_side')
+        files = user_identity_post_parser.parse_args()
+        obverse_side = files.get('obverse')
+        reverse_side = files.get('reverse')
         verify_result = self.verify_picture(obverse_side, "正面") + self.verify_picture(reverse_side, "背面")
         if verify_result:
             return {
                 'status': 'failure',
                 'error': verify_result
             }, 400
-        obverse_side_file = os.path.relpath(
-            os.path.join(
-                app.root_path, "..", GrimmConfig.GRIMM_USER_DOCUMENT_UPLOAD_PATH,
-                f'{openid}_obverse_side.jpg'), app.root_path)
-        reverse_side_file = os.path.relpath(
-            os.path.join(
-                app.root_path, "..", GrimmConfig.GRIMM_USER_DOCUMENT_UPLOAD_PATH,
-                f'{openid}_reverse_side.jpg'), app.root_path)
-        obverse_side.save(os.path.join(app.root_path, obverse_side_file))
-        reverse_side.save(os.path.join(app.root_path, reverse_side_file))
-        insert_stmt = insert(UserDocument).values(
-            openid=openid,
-            id_document_obverse_side_path=obverse_side_file,
-            id_document_reverse_side_path=reverse_side_file,
-        )
-        upsert_stmt = insert_stmt.on_duplicate_key_update(
-            id_document_obverse_side_path=insert_stmt.inserted.id_document_obverse_side_path,
-            id_document_reverse_side_path=insert_stmt.inserted.id_document_reverse_side_path,
-        )
-        db.session.execute(upsert_stmt)
+
+        user = User.query.filter(User.openid == openid).first()
+        if user is None:
+            return {
+                'status': 'failure',
+                'error': '用户信息未找到'
+            }, 404
+
+        obverse_side_file = f'{openid}_obverse_side.jpg'
+        reverse_side_file = f'{openid}_reverse_side.jpg'
+        obverse_side.save(user_idcard_realpath(obverse_side_file))
+        reverse_side.save(user_idcard_realpath(reverse_side_file))
+
+        user.idcard_obverse_path = obverse_side_file
+        user.idcard_reverse_path = reverse_side_file
+        db.session.add(user)
         db.session.commit()
         return {
             'status': 'success'
         }, 200
 
+user_identity_image_get_parser = reqparse.RequestParser()
+user_identity_image_get_parser.add_argument('side', type=str, required=True, location="args")
+user_identity_image_get_parser.add_argument('token', type=str, required=True, location="args")
 
-@admin.route("/user_identity/<string:openid>", methods=['GET'])
+@admin.route("/user_idcard/image/<string:target_openid>", methods=['GET'])
 class UserIdentityImage(Resource):
-
     @api.expect(user_identity_image_get_parser)
-    def get(self, openid):
+    def get(self, target_openid):
         args = user_identity_image_get_parser.parse_args()
         side = args.get('side')
         token = args.get('token')
-        record = PreSignedUrl.query.filter(PreSignedUrl.token == token).first()
-        openid = request.headers.get('Authorization')
+        # TODO change to JWT get_jwt_identity
+        requester = request.headers.get('Authorization')
 
-        if not record or record.openid != openid:
+        if side not in ('obverse', 'reverse'):
+            return {
+                "status": "failure",
+                "error": "参数错误: side"
+            }, 400
+
+        record = PreSignedUrl.query.filter(PreSignedUrl.token == token).first()
+        if not record or record.openid != requester or record.target_openid != target_openid:
             return {
                 "status": "failure",
                 "error": "非法口令"
@@ -754,20 +776,11 @@ class UserIdentityImage(Resource):
                 "error": "口令已过期"
             }, 404
 
-        granted_openid = record.openid
-        if granted_openid != openid:
-            return {
-                "status": "failure",
-                "error": "非法口令"
-            }, 404
-        user_doc: UserDocument = UserDocument.query.filter(UserDocument.openid == record.target_openid).first()
-        if not user_doc:
+        user = User.query.filter(User.openid == target_openid).first()
+        if not user or not user.idcard_obverse_path or not user.idcard_reverse_path:
             return {
                 "status": "failure",
                 "error": "用户身份证信息未找到"
             }, 404
 
-        if side == 'obverse_side':
-            return send_file(os.path.join(app.root_path, user_doc.id_document_obverse_side_path), mimetype='image/jpeg')
-        elif side == 'reverse_side':
-            return send_file(os.path.join(app.root_path, user_doc.id_document_reverse_side_path), mimetype='image/jpeg')
+        return send_file(user_idcard_realpath(getattr(user, f'idcard_{side}_path')), mimetype='image/jpeg')
