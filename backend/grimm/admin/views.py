@@ -688,7 +688,7 @@ user_identity_post_parser = reqparse.RequestParser()
 user_identity_post_parser.add_argument('obverse', type=FileStorage, required=True, location="files")
 user_identity_post_parser.add_argument('reverse', type=FileStorage, required=True, location="files")
 
-@admin.route("/user_idcard/image", methods=['POST'])
+@admin.route("/user_idcard/image/<string:target_openid>", methods=['POST'])
 class UploadUserIdentity(Resource):
     UserIdentityPostModel = api.model('UserIdentityPost', {
         "reverse": fields.String(required=True, description="身份证反面照片"),
@@ -709,9 +709,10 @@ class UploadUserIdentity(Resource):
     @api.response(200, 'Success')
     @api.response(400, 'Invalid request body', ErrorResponseModel)
     @api.expect(user_identity_post_parser)
-    def post(self):
+    def post(self, target_openid):
         # TODO change to JWT get_jwt_identity
-        openid = request.headers.get('Authorization')
+        # openid = request.headers.get('Authorization')
+        openid = target_openid
 
         files = user_identity_post_parser.parse_args()
         obverse_side = files.get('obverse')

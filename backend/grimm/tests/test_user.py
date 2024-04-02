@@ -357,9 +357,10 @@ class TestUserIDCard(UserCase):
         mock_save.assert_any_call(reverse_side_file)
 
     def test_post_no_files(self):
+        openid = self.default_volunteer_attrs['openid']
         with self.client as client:
-            response = client.post(self.image_url, data={},
-                                   headers={'Authorization': 'test_openid'})
+            response = client.post(f'{self.image_url}/{openid}', data={},
+                                   headers={'Authorization': openid})
 
         self.assertEqual(response.status_code, 400)
 
