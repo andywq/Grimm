@@ -323,8 +323,8 @@ class TestUserIDCard(UserCase):
 
             # Verify that the pre-signed token is stored in the database with the correct expiration time
             for side in constants.USER_IDENTITY_IMAGE_SIDE:
-                token = data['urls'][side].split('token=')[1]
-                self.assertTrue(data['urls'][side].startswith('/user_identity/image/'))
+                token = data['urls'][side].split('token=')[1].split('&')[0]
+                self.assertTrue(data['urls'][side].startswith('/user_idcard/image/'))
                 self.assertTrue(uuid.UUID(token, version=4))  # Check if the token is a valid UUIDv4
                 pre_signed_url = db.session.query(PreSignedUrl).filter_by(token=token).first()
                 self.assertIsNotNone(pre_signed_url)
@@ -337,7 +337,7 @@ class TestUserIDCard(UserCase):
         mock_save.return_value = None
 
         openid = self.default_volunteer_attrs['openid']
-        response = self.client.post(self.image_url,
+        response = self.client.post(f'{self.image_url}/{openid}',
                        data={
                            'obverse': (io.BytesIO(b"dummy data"), 'obverse.jpg'),
                            'reverse': (io.BytesIO(b"dummy data"), 'obverse.jpg')
